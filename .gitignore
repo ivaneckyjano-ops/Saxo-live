@@ -1,0 +1,29 @@
+.env
+# Virtuálne prostredia
+.venv/
+opt/.venv/
+
+# Nastavenia IDE / editorov
+.vscode/
+
+# Konfiguračné a token súbory (nepublikujte!)
+config.ini
+tokens.json
+
+# Dočasné / log súbory
+*.log
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.sqlite
+*.json
+
+
+# Ostatné súbory, ktoré nechcete verzovať
+ss.txt
+drop_saxo_live.txt
+old_saxo.py
+test_saxo.py
+test_saxo_with_env_token.py
+readmy_trad-den_py

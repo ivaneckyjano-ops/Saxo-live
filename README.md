@@ -1,3 +1,2 @@
 <<<<<<< HEAD
-# Saxo‑live
-Tento repozitár obsahuje kód pre projekt Saxo‑live.
+QQQ ziskava token pre aplikaciu QQQ na demoSaxo developerportál
