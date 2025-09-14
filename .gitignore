@@ -1,7 +1,6 @@
 
 # Virtuálne prostredia
 .venv/
-opt/.venv/
 
 # Nastavenia IDE / editorov
 .vscode/
