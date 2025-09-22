@@ -1,193 +1,157 @@
-from __future__ import annotations
+#!/usr/bin/env python3
+# collector.py – sťahuje cenu QQQ každých 15 minút a automaticky obnovuje OAuth token
+# Používa Saxo SIM API (REST) namiesto IB‑Gateway.
+
 import os
+import sys
 import json
 import time
 import signal
 import pathlib
-from typing import Optional, Dict
-from ib_insync import Stock
+from typing import Dict
 
-#!/usr/bin/env python3
-# collector.py – sťahuje dáta každých 5 min. a automaticky obnovuje token
-# Upravené: robustnejší refresh, bezpečné ukladanie tokenu, čisté ukončenie.
-
-import urllib.request
-import urllib.parse
-import urllib.error
-
-from ib_insync import IB  # pip install ib_insync
+# Naše vlastné wrapper‑funkcie (saxo_client.py)
+from saxo_client import get, get_valid_token
 
 # -------------------- KONFIGURÁCIA --------------------
-CLIENT_ID       = "4252e068bf8b41b4a41545b73d1ccc6d"
-CLIENT_SECRET   = "9c4a5493160a4a72b91febb98e7cd63c"
-TOKEN_ENDPOINT  = "https://sim.logonvalidation.net/token"
-TOKEN_FILE      = pathlib.Path(os.path.expanduser("~/.ibkr_token.json"))
-IB_HOST         = "127.0.0.1"
-IB_PORT         = 7497
-IB_CLIENT_ID    = 1                     # libib‑clientId
+SYMBOL          = "QQQ"                     # ticker, ktorý chceme sledovať
+EXCHANGE_ID     = "XNAS"                    # v SIM‑prostredí často nie je potrebné, ale ponecháme ako “fallback”
+CURRENCY        = "USD"
+PRICE_ENDPOINT  = "https://gateway.saxobank.com/sim/openapi/port/v1/infoprices"
+SLEEP_INTERVAL  = 900                       # 15 min = 900 s
 # -----------------------------------------------------
 
+# -------------------- SIGNAL HANDLING --------------------
 _shutdown = False
 
-
 def _handle_signal(signum, frame):
+    """Zachytí SIGINT / SIGTERM a nastaví flag, aby sme sa pekne ukončili."""
     global _shutdown
     _shutdown = True
-    print(f"Signal {signum} received — ukončujem po aktuálnej iterácii.")
+    print(f"\nSignal {signum} received – ukončujem po aktuálnej iterácii.")
 
-
-signal.signal(signal.SIGINT, _handle_signal)
+signal.signal(signal.SIGINT,  _handle_signal)
 signal.signal(signal.SIGTERM, _handle_signal)
+# -------------------------------------------------------
 
+# -------------------- UIC RESOLUTION --------------------
+def resolve_uic(symbol: str,
+               exchange_id: str = EXCHANGE_ID,
+               currency: str = CURRENCY) -> int:
+    """
+    Zistí UIC (Unique Instrument Code) pre daný symbol v SIM‑prostredí.
+    Na niektoré tickery (napr. QQQ) je potrebné:
+      • povoliť IncludeNonTradable = true
+      • pridať CountryId = US
+      • v prípade neúspešného výsledku skúsiť požiadavku aj bez ExchangeId
+    """
+    url = "https://gateway.saxobank.com/sim/openapi/ref/v1/instruments"
 
-# ---------- 1. načítanie a uloženie tokenu ----------
-def load_token() -> Optional[Dict]:
-    try:
-        with TOKEN_FILE.open("r", encoding="utf-8") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return None
-    except Exception as e:
-        raise RuntimeError(f"Chyba pri čítaní token súboru: {e}")
-
-
-def save_token(data: Dict) -> None:
-    tmp = TOKEN_FILE.with_suffix(".tmp")
-    try:
-        with tmp.open("w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-        # atomický presun a nastavenie prístupových práv
-        tmp.replace(TOKEN_FILE)
-        TOKEN_FILE.chmod(0o600)
-        print(f"Token saved to {TOKEN_FILE}")
-    finally:
-        if tmp.exists():
-            try:
-                tmp.unlink()
-            except Exception:
-                pass
-
-
-# ---------- 2. refresh ----------
-def refresh_token(refresh_tok: str, retries: int = 2, backoff: float = 1.0) -> Dict:
-    payload = {
-        "grant_type":    "refresh_token",
-        "refresh_token": refresh_tok,
-        "client_id":     CLIENT_ID,
-        "client_secret": CLIENT_SECRET,
+    # Základné parametre – používame IncludeNonTradable=true a CountryId=US,
+    # pretože v sandboxe niekedy vracajú “non‑tradable” varianty.
+    params = {
+        "AssetTypes":        "Stock",
+        "Filter":            symbol,
+        "Currency":          currency,
+        "IncludeNonTradable":"true",
+        "StartIndex":        0,
+        "Count":             10,
+        "CountryId":         "US",
     }
-    body = urllib.parse.urlencode(payload).encode()
-    req = urllib.request.Request(TOKEN_ENDPOINT, data=body, method="POST")
-    req.add_header("Content-Type", "application/x-www-form-urlencoded")
 
-    last_exc = None
-    for attempt in range(1 + retries):
-        try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                raw = resp.read().decode()
-                data = json.loads(raw)
-            # pridáme absolútny čas expirácie (unix timestamp)
-            data["exp"] = int(time.time()) + int(data.get("expires_in", 0))
-            return data
-        except urllib.error.HTTPError as e:
-            # Ak server vrátil 4xx/5xx, nechceme nekonečne retryovať pri 4xx
-            last_exc = e
-            if 400 <= e.code < 500:
-                raise RuntimeError(f"HTTP error {e.code}: {e.read().decode()}")
-        except Exception as e:
-            last_exc = e
+    # Pridáme ExchangeId, ak je definovaný – môže pomôcť, ale nie je povinný.
+    if exchange_id:
+        params["ExchangeId"] = exchange_id
 
-        if attempt < retries:
-            sleep_for = backoff * (2 ** attempt)
-            print(f"Refresh failed (attempt {attempt+1}), retryujem o {sleep_for:.1f}s...")
-            time.sleep(sleep_for)
+    # Prvý pokus (s ExchangeId)
+    resp = get(url, params=params)
+    data = resp.get("Data", [])
+    if data:
+        return int(data[0]["Uic"])
 
-    raise RuntimeError(f"Failed to refresh token: {last_exc}")
+    # Ak sme nedostali žiadny výsledok, skúšame **bez** ExchangeId
+    if "ExchangeId" in params:
+        params.pop("ExchangeId")
+        resp = get(url, params=params)
+        data = resp.get("Data", [])
+        if data:
+            return int(data[0]["Uic"])
 
-
-# ---------- 3. získať platný access_token ----------
-def get_valid_token() -> Dict:
-    tok = load_token()
-    if not tok:
-        raise RuntimeError(
-            "Token súbor chýba – najskôr spusti OAuth flow (QQQ_demo_apl.py)."
-        )
-
-    now = int(time.time())
-    # ak token má v sebe pole "exp" – použijeme ho, inak ho spočítame
-    if "exp" not in tok:
-        tok["exp"] = now + int(tok.get("expires_in", 0))
-
-    if now < tok["exp"] - 30:               # ešte platný (30 s rezerva)
-        return tok
-
-    # access token expiroval → refresh
-    print("Access token expired – obnovujem pomocou refresh_token.")
-    refreshed = refresh_token(tok["refresh_token"])
-    # ak server vráti nový refresh_token, tak ho uložíme
-    if "refresh_token" not in refreshed:
-        refreshed["refresh_token"] = tok["refresh_token"]
-    save_token(refreshed)
-    return refreshed
-
-
-# ---------- 4. funkcia na sťahovanie dát ----------
-def download_qqq_data(ib: IB) -> None:
-    # QQQ (NASDAQ‑100) – futures?  Tu používame spot‑symbol QQQ
-    contract = Stock("QQQ", "SMART", "USD")
-    qualified = ib.qualifyContracts(contract)
-    if not qualified:
-        print("Kontrakt nebolo možné kvalifikovať.")
-        return
-    contract = qualified[0]
-
-    # 5‑minútové historické OHLC (1‑minúta bar)
-    bars = ib.reqHistoricalData(
-        contract,
-        endDateTime='',
-        durationStr='5 M',
-        barSizeSetting='1 min',
-        whatToShow='TRADES',
-        useRTH=False,
-        formatDate=1,
+    # Zlyhalo aj po odstránení ExchangeId – vypíšeme úplnú odpoveď API,
+    # aby ste videli, čo Saxo vrátil.
+    raise RuntimeError(
+        f"Nenašiel som UIC pre {symbol} (exchange={exchange_id}). "
+        f"API odpoveď: {json.dumps(resp, indent=2)}"
     )
-    if bars:
-        last = bars[-1]
-        print(
-            f"{last.date}  O:{last.open:.2f}  H:{last.high:.2f}  "
-            f"L:{last.low:.2f}  C:{last.close:.2f}"
-        )
-    else:
-        print("Žiadne historické dáta.")
+# -------------------------------------------------------
 
+# -------------------- PRICE FETCHING --------------------
+def fetch_last_price(uic: int) -> None:
+    """
+    Načítanie poslednej ceny (Bid/Ask/Last) pre zadaný UIC.
+    Výsledok sa vypíše na stdout.
+    """
+    params = {
+        "Uic":       uic,
+        "AssetType": "Stock",      # pre QQQ je typ Stock (ETF)
+        # AccountKey nie je povinný pre infoprices, takže ho vynecháme
+    }
 
-# ---------- 5. hlavná slučka ----------
+    resp = get(PRICE_ENDPOINT, params=params)
+
+    # Odpoveď typicky obsahuje polia Bid, Ask, Last, Mid a SnapshotTime
+    bid   = resp.get("Bid",   {}).get("Price")
+    ask   = resp.get("Ask",   {}).get("Price")
+    last  = resp.get("Last",  {}).get("Price")
+    mid   = resp.get("Mid",   {}).get("Price")
+    ts    = resp.get("SnapshotTime")   # ISO‑8601 časová značka
+
+    # Ak Last nie je prítomný, použijeme Mid (alebo Bid/Ask ako poslednú cenu)
+    price_display = last if last is not None else mid
+
+    print(f"[{ts}] Symbol: {SYMBOL} – Bid: {bid}, Ask: {ask}, Price: {price_display}")
+# -------------------------------------------------------
+
+# -------------------- MAIN LOOP --------------------
 def main() -> None:
-    global _shutdown
-    while not _shutdown:
-        ib = None
-        try:
-            token = get_valid_token()                 # refresh, ak treba
-            # ib_insync momentálne nepoužíva access_token pri pripojení k IB‑Gateway.
-            # Token slúži iba pre Client‑Portal API, ale ho musíme mať.
-            ib = IB()
-            ib.connect(host=IB_HOST, port=IB_PORT, clientId=IB_CLIENT_ID, timeout=10)
-            download_qqq_data(ib)
-        except Exception as e:
-            print("ERROR:", e)
-        finally:
-            if ib is not None and ib.isConnected():
-                try:
-                    ib.disconnect()
-                except Exception:
-                    pass
+    """
+    Hlavná slučka:
+      1. Získame (a prípadne refreshneme) token – to robí saxo_client.
+      2. Zistíme UIC pre požadovaný symbol (jednorazovo, pretože sa nemení).
+      3. V cykle každých SLEEP_INTERVAL sekúnd načítame cenu a vypíšeme ju.
+      4. Na SIGINT/SIGTERM sa ukončí po ukončení aktuálnej iterácie.
+    """
+    # 1️⃣ Získame platný token – ak je potrebné, automaticky sa refreshne.
+    try:
+        _ = get_valid_token()
+    except Exception as e:
+        print("ERROR – nepodarilo sa načítať alebo obnoviť token:", e)
+        sys.exit(1)
 
-        # čakáme 5 minút (300 s), ale umožníme rýchle ukončenie
-        for _ in range(300):
+    # 2️⃣ Zistíme UIC – ak sa nepodarí, ukončíme program s chybou.
+    try:
+        uic = resolve_uic(SYMBOL)
+        print(f"Uic pre {SYMBOL} = {uic}")
+    except Exception as e:
+        print("ERROR pri získavaní UIC:", e)
+        sys.exit(1)
+
+    # 3️⃣ Hlavná slučka – každých 15 minút načítame cenu.
+    while not _shutdown:
+        try:
+            fetch_last_price(uic)
+        except Exception as err:
+            print("ERROR pri získavaní ceny:", err)
+
+        # Počkáme SLEEP_INTERVAL sekúnd, ale kontrolujeme signál každú sekundu,
+        # aby sme sa pri Ctrl+C nečakali celých 15 minút.
+        for _ in range(SLEEP_INTERVAL):
             if _shutdown:
                 break
             time.sleep(1)
 
+    print("\nCollector ukončený – ďakujem za sledovanie.")
 
+# -------------------------------------------------------
 if __name__ == "__main__":
     main()
