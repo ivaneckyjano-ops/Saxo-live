@@ -26,3 +26,7 @@ old_saxo.py
 test_saxo.py
 test_saxo_with_env_token.py
 readmy_trad-den_py
+*.bak
+__pycache__/
+*.pyc
+.ibkr_token.json
